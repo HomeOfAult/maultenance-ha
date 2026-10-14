@@ -4,6 +4,28 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Actions tab -> CI -> Run workflow: cut a release on demand. Only does
+  # anything when run from main.
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: >-
+          Version bump for the new release. "auto" works it out from the commits
+          since the last release, as a push to main does. The others force that
+          bump even when nothing releasable has landed.
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
+
+permissions:
+  contents: read
+
+# Serialize pushes/dispatches so two close together can't both compute the same
+# next version and race to create the same tag. Superseded PR runs are simply
+# cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || 'release' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
@@ -23,7 +45,7 @@ jobs:
   # is tracked separately; this just catches local regressions once
   # something's actually on main.
   hacs:
-    if: github.event_name == 'push'
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,3 +58,79 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: home-assistant/actions/hassfest@master
+
+  # Works out the release version without side effects (nothing is tagged
+  # here), so a failed check never leaves a release behind.
+  #   - a push to main: the next version from Conventional Commits since the
+  #     last tag (scripts/next-version.sh): feat -> minor, fix -> patch,
+  #     breaking -> major (minor while still in 0.y.z); docs/chore/ci/etc.
+  #     release nothing
+  #   - Run workflow on main with a bump: that bump, whatever the commits say
+  version:
+    needs: [test, hacs, hassfest]
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Work out release version
+        id: version
+        env:
+          # Empty on push events. Passed through the environment, never
+          # interpolated into the script.
+          BUMP: ${{ inputs.bump }}
+        run: |
+          git fetch --tags --force
+          force=""
+          if [ -n "$BUMP" ] && [ "$BUMP" != auto ]; then force="$BUMP"; fi
+          tag=$(bash scripts/next-version.sh ${force:+"$force"})
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "release_version=${tag#v}"
+
+  # Tags and releases only after test, hassfest and hacs have passed.
+  # hacs.json sets zip_release, so HACS installs the maultenance.zip asset
+  # rather than the tag's source archive. The zip is built here with
+  # manifest.json's "version" set to the release version: the in-repo value is
+  # only a placeholder, since the version is decided after merge and nothing
+  # may push to main. The release is created with GITHUB_TOKEN, so the new tag
+  # does not re-trigger this workflow.
+  release:
+    needs: version
+    if: needs.version.outputs.version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build maultenance.zip with the release version
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          src=custom_components/maultenance
+          jq --arg v "$VERSION" '.version = $v' "$src/manifest.json" > manifest.tmp
+          mv manifest.tmp "$src/manifest.json"
+          (cd "$src" && zip -r -q "$GITHUB_WORKSPACE/maultenance.zip" . -x '*__pycache__*')
+
+      - name: Create tag and GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          if gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release v${VERSION} already exists"
+            exit 0
+          fi
+          echo "creating release v${VERSION} at ${GITHUB_SHA}"
+          gh release create "v${VERSION}" maultenance.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "v${VERSION}" \
+            --generate-notes
+          echo "Released v${VERSION}" >> "$GITHUB_STEP_SUMMARY"
