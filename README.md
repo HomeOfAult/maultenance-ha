@@ -82,6 +82,10 @@ python3 -m venv .venv
 .venv/bin/pytest tests/ -v
 ```
 
+## Releases
+
+Merging to `main` cuts a release automatically when the commits since the last tag are releasable Conventional Commits (`feat:` -> minor, `fix:` -> patch, breaking -> minor while in 0.y.z; `docs`/`chore`/`ci` release nothing). CI creates the `vX.Y.Z` tag and GitHub Release and attaches `maultenance.zip`, which HACS installs. The `version` in `manifest.json` is set to the release version inside that zip; the value committed in the repo is only a placeholder. To cut one by hand, run the CI workflow from the Actions tab on `main` and pick a bump.
+
 ## Status
 
 Read/write task sync (todo list + per-task sensors) is implemented. A digest/aggregate sensor for physical displays (e-ink, receipt printer) is a planned follow-up — see open issues.
